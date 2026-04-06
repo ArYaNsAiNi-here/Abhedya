@@ -153,13 +153,13 @@ SIMPLE_JWT = {
 # ──────────────────────────────────────────────
 CORS_ALLOWED_ORIGINS = config(
     "CORS_ALLOWED_ORIGINS",
-    default="http://localhost:3000,http://localhost:5173,https://abhedya-ikjj.onrender.com",
+    default="http://localhost:3000,http://localhost:5173,https://abhedya-ikjj.onrender.com,https://abhedya-green.vercel.app",
     cast=Csv(),
 )
 CORS_ALLOW_CREDENTIALS = True
 
 
-CSRF_TRUSTED_ORIGINS=['https://abhedya-ikij.onrender.com']
+CSRF_TRUSTED_ORIGINS=['https://abhedya-ikij.onrender.com','https://abhedya-green.vercel.app']
 
 
 # ──────────────────────────────────────────────
