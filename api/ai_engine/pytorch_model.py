@@ -1,5 +1,5 @@
 """
-SecureVault — Password Predictability Engine
+Abhedya — Password Predictability Engine
 =============================================
 Character-level RNN (LSTM) that estimates the statistical probability of a
 password being guessed by a human or a pattern-based attacker.
@@ -35,6 +35,7 @@ import logging
 import math
 import os
 import random
+import re
 import string
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -48,7 +49,7 @@ from torch.utils.data import DataLoader, Dataset, random_split
 # ---------------------------------------------------------------------------
 # Logging — never emit password content
 # ---------------------------------------------------------------------------
-logger = logging.getLogger("securevault.ai_engine")
+logger = logging.getLogger("abhedya.ai_engine")
 logger.setLevel(logging.INFO)
 
 # ---------------------------------------------------------------------------
@@ -73,6 +74,10 @@ MEDIUM_THRESHOLD: float = 0.30
 # Default model weights path (relative to this file's directory).
 DEFAULT_WEIGHTS_DIR: Path = Path(__file__).resolve().parent / "weights"
 DEFAULT_WEIGHTS_PATH: Path = DEFAULT_WEIGHTS_DIR / "password_rnn.pt"
+WEIGHTS_ENV_VAR: str = "ABHEDYA_PASSWORD_MODEL_WEIGHTS"
+PROJECT_ROOT: Path = Path(__file__).resolve().parents[2]
+LEGACY_BILSTM_WEIGHTS_PATH: Path = PROJECT_ROOT / "bilstm_password_weights.pth"
+BILSTM_COMPAT_SEQ_LEN: int = 32
 
 
 # ---------------------------------------------------------------------------
@@ -110,6 +115,18 @@ def tokenize(password: str, max_len: int = MAX_SEQ_LEN) -> torch.Tensor:
         # Edge-case: empty or fully-unknown input → single PAD token.
         indices = [PAD_IDX]
     return torch.tensor(indices, dtype=torch.long)
+
+
+def tokenize_fixed(password: str, max_len: int = BILSTM_COMPAT_SEQ_LEN) -> torch.Tensor:
+    """Fixed-length tokenization for legacy BiLSTM checkpoints.
+
+    This mirrors the encoding scheme used by `train_bilstm.py` where:
+        - unknown chars map to PAD(0)
+        - sequence is right-padded/truncated to fixed max_len
+    """
+    encoded = [CHAR_TO_IDX.get(ch, PAD_IDX) for ch in password[:max_len]]
+    encoded += [PAD_IDX] * (max_len - len(encoded))
+    return torch.tensor(encoded, dtype=torch.long)
 
 
 def collate_batch(
@@ -368,6 +385,52 @@ class PasswordRNN(nn.Module):
         return score
 
 
+class PasswordBiLSTMCompat(nn.Module):
+    """Compatibility model for `bilstm_password_weights.pth` checkpoints."""
+
+    def __init__(
+        self,
+        vocab_size: int = VOCAB_SIZE,
+        embed_dim: int = 32,
+        hidden_dim: int = 64,
+        num_layers: int = 2,
+        pad_idx: int = PAD_IDX,
+    ) -> None:
+        super().__init__()
+        self.pad_idx = pad_idx
+        self.embedding = nn.Embedding(
+            num_embeddings=vocab_size,
+            embedding_dim=embed_dim,
+            padding_idx=pad_idx,
+        )
+        self.lstm = nn.LSTM(
+            input_size=embed_dim,
+            hidden_size=hidden_dim,
+            num_layers=num_layers,
+            batch_first=True,
+            bidirectional=True,
+        )
+        self.fc = nn.Linear(hidden_dim * 2, 1)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        lengths: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        embedded = self.embedding(x)
+        lstm_out, _ = self.lstm(embedded)
+
+        if lengths is None:
+            lengths = (x != self.pad_idx).sum(dim=1)
+        lengths = lengths.to(x.device).clamp(min=1, max=x.size(1))
+
+        gather_index = (lengths - 1).view(-1, 1, 1).expand(-1, 1, lstm_out.size(2))
+        last_time_step = lstm_out.gather(1, gather_index).squeeze(1)
+        out = self.fc(last_time_step)
+        return self.sigmoid(out).squeeze(-1)
+
+
 # ============================================================================
 #  4. TRAINING ENGINE
 # ============================================================================
@@ -548,8 +611,10 @@ def _entropy_score(password: str) -> float:
 #  6. GLOBAL MODEL SINGLETON (lazy-loaded)
 # ============================================================================
 
-_model_instance: Optional[PasswordRNN] = None
+_model_instance: Optional[nn.Module] = None
 _model_device: Optional[torch.device] = None
+_model_kind: str = "password_rnn"
+_model_weights_path: Optional[Path] = None
 
 
 def _get_device() -> torch.device:
@@ -559,11 +624,79 @@ def _get_device() -> torch.device:
     return torch.device("cpu")
 
 
+def _extract_state_dict(payload: object) -> dict[str, torch.Tensor]:
+    """Extract state_dict from raw torch checkpoint payload."""
+    if isinstance(payload, dict):
+        if payload and all(isinstance(v, torch.Tensor) for v in payload.values()):
+            return payload  # plain state_dict
+
+        for key in ("state_dict", "model_state_dict"):
+            nested = payload.get(key)
+            if isinstance(nested, dict) and nested and all(
+                isinstance(v, torch.Tensor) for v in nested.values()
+            ):
+                return nested
+
+    raise ValueError("Unsupported checkpoint format: expected state_dict-like payload")
+
+
+def _infer_checkpoint_kind(state: dict[str, torch.Tensor]) -> str:
+    keys = set(state.keys())
+    if any(k.startswith("classifier.") for k in keys):
+        return "password_rnn"
+    if "fc.weight" in keys and "lstm.weight_ih_l0" in keys:
+        return "bilstm_compat"
+    return "password_rnn"
+
+
+def _infer_bilstm_compat_hparams(
+    state: dict[str, torch.Tensor],
+) -> tuple[int, int, int]:
+    embed_dim = int(state["embedding.weight"].shape[1])
+    hidden_dim = int(state["lstm.weight_hh_l0"].shape[1])
+
+    layer_indices: list[int] = []
+    pattern = re.compile(r"lstm\.weight_ih_l(\d+)(?:_reverse)?$")
+    for key in state.keys():
+        match = pattern.match(key)
+        if match:
+            layer_indices.append(int(match.group(1)))
+
+    num_layers = (max(layer_indices) + 1) if layer_indices else 2
+    return embed_dim, hidden_dim, num_layers
+
+
+def _resolve_weights_path(weights_path: Optional[str]) -> Path:
+    if weights_path:
+        return Path(weights_path)
+
+    env_weights = os.getenv(WEIGHTS_ENV_VAR)
+    env_path = Path(env_weights) if env_weights else None
+
+    if LEGACY_BILSTM_WEIGHTS_PATH.exists():
+        if env_path is None:
+            return LEGACY_BILSTM_WEIGHTS_PATH
+
+        # If env is still pointing at the old default RNN checkpoint,
+        # prefer the user-provided BiLSTM weights automatically.
+        try:
+            if env_path.resolve() == DEFAULT_WEIGHTS_PATH.resolve():
+                return LEGACY_BILSTM_WEIGHTS_PATH
+        except OSError:
+            if str(env_path) == str(DEFAULT_WEIGHTS_PATH):
+                return LEGACY_BILSTM_WEIGHTS_PATH
+
+    if env_path:
+        return env_path
+
+    return DEFAULT_WEIGHTS_PATH
+
+
 def load_model(
     weights_path: Optional[str] = None,
     device: Optional[str] = None,
     hp: Optional[HyperParams] = None,
-) -> PasswordRNN:
+) -> nn.Module:
     """Load (or reload) the global model singleton.
 
     Parameters
@@ -575,36 +708,94 @@ def load_model(
 
     Returns the loaded model (also cached globally for ``predict_strength``).
     """
-    global _model_instance, _model_device
+    global _model_instance, _model_device, _model_kind, _model_weights_path
 
     hp = hp or HyperParams()
     _model_device = torch.device(device) if device else _get_device()
 
-    model = PasswordRNN(
-        vocab_size=VOCAB_SIZE,
-        embed_dim=hp.embed_dim,
-        hidden_dim=hp.hidden_dim,
-        num_layers=hp.num_layers,
-        dropout=hp.dropout,
-        bidirectional=hp.bidirectional,
-    )
+    resolved_path = _resolve_weights_path(weights_path)
 
-    resolved_path = Path(weights_path) if weights_path else DEFAULT_WEIGHTS_PATH
+    model: nn.Module
+    checkpoint_kind = "password_rnn"
     if resolved_path.exists():
-        state = torch.load(resolved_path, map_location=_model_device, weights_only=True)
-        model.load_state_dict(state)
-        logger.info("Loaded weights from %s onto %s", resolved_path, _model_device)
+        try:
+            raw = torch.load(resolved_path, map_location=_model_device, weights_only=True)
+        except TypeError:
+            raw = torch.load(resolved_path, map_location=_model_device)
+
+        state = _extract_state_dict(raw)
+        checkpoint_kind = _infer_checkpoint_kind(state)
+
+        if checkpoint_kind == "bilstm_compat":
+            embed_dim, hidden_dim, num_layers = _infer_bilstm_compat_hparams(state)
+            model = PasswordBiLSTMCompat(
+                vocab_size=VOCAB_SIZE,
+                embed_dim=embed_dim,
+                hidden_dim=hidden_dim,
+                num_layers=num_layers,
+            )
+        else:
+            model = PasswordRNN(
+                vocab_size=VOCAB_SIZE,
+                embed_dim=hp.embed_dim,
+                hidden_dim=hp.hidden_dim,
+                num_layers=hp.num_layers,
+                dropout=hp.dropout,
+                bidirectional=hp.bidirectional,
+            )
+
+        model.load_state_dict(state, strict=True)
+        logger.info(
+            "Loaded %s weights from %s onto %s",
+            checkpoint_kind,
+            resolved_path,
+            _model_device,
+        )
     else:
+        model = PasswordRNN(
+            vocab_size=VOCAB_SIZE,
+            embed_dim=hp.embed_dim,
+            hidden_dim=hp.hidden_dim,
+            num_layers=hp.num_layers,
+            dropout=hp.dropout,
+            bidirectional=hp.bidirectional,
+        )
         logger.warning(
             "No weights found at %s — model is uninitialised.  "
-            "Call `train_model()` first or supply a valid path.",
+            "Call `train_model()` first or supply a valid path via argument or %s.",
             resolved_path,
+            WEIGHTS_ENV_VAR,
         )
 
     model.to(_model_device)
     model.eval()
     _model_instance = model
+    _model_kind = checkpoint_kind
+    _model_weights_path = resolved_path
     return model
+
+
+def get_model_runtime_info() -> dict:
+    """Return active model runtime metadata for diagnostics/UI visibility."""
+    global _model_instance, _model_device, _model_kind, _model_weights_path
+
+    if _model_instance is None:
+        try:
+            load_model()
+        except Exception:
+            pass
+
+    resolved_path = _model_weights_path or _resolve_weights_path(None)
+    weights_file = resolved_path.name
+
+    return {
+        "model_kind": _model_kind if _model_instance is not None else "unavailable",
+        "device": str(_model_device) if _model_device is not None else "unavailable",
+        "weights_path": str(resolved_path),
+        "weights_file": weights_file,
+        "model_loaded": _model_instance is not None,
+        "weights_found": resolved_path.exists(),
+    }
 
 
 # ============================================================================
@@ -622,7 +813,7 @@ def predict_strength(password: str) -> float:
 
     Security: the raw password is never logged, stored, or transmitted.
     """
-    global _model_instance, _model_device
+    global _model_instance, _model_device, _model_kind
 
     # ---- Fallback path ----
     if _model_instance is None:
@@ -636,16 +827,21 @@ def predict_strength(password: str) -> float:
         return _entropy_score(password)
 
     try:
-        tokens = tokenize(password).unsqueeze(0).to(_model_device)  # (1, L)
-        length = torch.tensor([tokens.size(1)], dtype=torch.long).to(_model_device)
-        score = _model_instance(tokens, length).item()
+        if _model_kind == "bilstm_compat":
+            tokens = tokenize_fixed(password, max_len=BILSTM_COMPAT_SEQ_LEN).unsqueeze(0).to(_model_device)
+            lengths = (tokens != PAD_IDX).sum(dim=1).clamp(min=1)
+            score = _model_instance(tokens, lengths).item()
+            del tokens, lengths
+        else:
+            tokens = tokenize(password).unsqueeze(0).to(_model_device)  # (1, L)
+            length = torch.tensor([tokens.size(1)], dtype=torch.long).to(_model_device)
+            score = _model_instance(tokens, length).item()
+            del tokens, length
 
-        # Explicitly delete tensors to prevent any residual data leaks.
-        del tokens, length
         if _model_device and _model_device.type == "cuda":
             torch.cuda.empty_cache()
 
-        return round(score, 4)
+        return max(0.0, min(1.0, float(score)))
     except Exception as exc:
         logger.error("Inference failed (%s) — falling back to entropy.", exc)
         return _entropy_score(password)
@@ -683,7 +879,6 @@ def predict_strength_detailed(password: str) -> dict:
     """
     score = predict_strength(password)
     entropy = _entropy_score(password)
-
     if score >= WEAK_THRESHOLD:
         label = "weak"
     elif score >= MEDIUM_THRESHOLD:
@@ -732,7 +927,7 @@ if __name__ == "__main__":
     import sys
 
     parser = argparse.ArgumentParser(
-        description="SecureVault Password Predictability Engine"
+        description="Abhedya Password Predictability Engine"
     )
     sub = parser.add_subparsers(dest="command")
 
